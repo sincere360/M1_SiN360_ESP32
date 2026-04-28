@@ -77,29 +77,6 @@ build/m1_esp32_merged.md5
 
 The `.md5` file must be exactly 32 uppercase hex characters with no newline.
 
-## Publish A GitHub Release
-
-After building the merged firmware and MD5 sidecar:
-
-```bash
-git tag -a v0.9.0.6 -m "M1 SiN360 ESP32-C6 v0.9.0.6"
-git push origin main
-git push origin v0.9.0.6
-
-gh release create v0.9.0.6 \
-  build/m1_esp32_merged.bin \
-  build/m1_esp32_merged.md5 \
-  --title "M1 SiN360 ESP32-C6 v0.9.0.6" \
-  --notes "ESP32-C6 companion firmware for M1 SiN360 STM32 v0.9.0.6. Includes the merged SD-update binary and uppercase MD5 sidecar."
-```
-
-Release assets should include only:
-
-```text
-m1_esp32_merged.bin
-m1_esp32_merged.md5
-```
-
 ## Notes
 
 WiFi promiscuous mode and BLE advertising share the ESP32-C6 radio. The firmware stops conflicting modes before starting new WiFi/BLE operations, but user-facing flows should still avoid running WiFi sniffers and BLE advertising at the same time.
