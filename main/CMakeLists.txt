@@ -1,0 +1,20 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "spi_slave.c"
+        "command_handler.c"
+        "wifi_scan.c"
+        "wifi_attack.c"
+        "pkt_monitor.c"
+        "evil_portal.c"
+        "ble_ops.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        driver
+        esp_wifi
+        esp_netif
+        nvs_flash
+        esp_http_server
+        bt
+        lwip
+)
