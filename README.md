@@ -1,3 +1,7 @@
+> **WARNING:** This is custom third-party firmware. Use at your own risk. The developer assumes no responsibility for bricked devices, hardware damage, fires, data loss, or any other issues that may result from flashing this firmware. By flashing this firmware, you accept full responsibility for any outcome.
+
+---
+
 # M1 SiN360 ESP32-C6 Firmware
 
 ESP32-C6 wireless coprocessor firmware for the M1 SiN360 STM32 firmware.
