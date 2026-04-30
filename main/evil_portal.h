@@ -6,6 +6,7 @@
 
 void portal_init(void);
 bool portal_prepare_ap(const char *ssid, uint8_t channel);
+void portal_set_active_ssid(const char *ssid);
 bool portal_services_start(bool reset_creds);
 void portal_services_stop(bool restore_sta);
 void portal_start(const m1_cmd_t *cmd, m1_resp_t *resp);

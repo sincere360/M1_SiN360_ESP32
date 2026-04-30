@@ -527,6 +527,9 @@ static void karma_set_ap_ssid(const char *ssid)
     ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
 
     esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+    if (karma_portal_mode) {
+        portal_set_active_ssid(ssid);
+    }
     strncpy(karma_current_ssid, ssid, sizeof(karma_current_ssid) - 1);
     karma_current_ssid[sizeof(karma_current_ssid) - 1] = '\0';
 }

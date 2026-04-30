@@ -10,11 +10,11 @@ This firmware runs on the M1's ESP32-C6 and provides the WiFi/BLE backend used b
 
 ## Compatibility
 
-This release is intended to pair with **M1 SiN360 STM32 firmware v0.9.0.6**.
+This release is intended to pair with **M1 SiN360 STM32 firmware v0.9.0.7**.
 
 STM32 release page:
 
-<https://github.com/sincere360/M1_SiN360/releases/tag/v0.9.0.6>
+<https://github.com/sincere360/M1_SiN360/releases/tag/v0.9.0.7>
 
 ## Features
 
@@ -24,9 +24,13 @@ STM32 release page:
 - Deauth, multi-target deauth, beacon spam, AP clone, Rickroll beacon, and probe request flood
 - Karma and Karma Portal support
 - Evil Portal captive DNS/HTTP service with credential capture
-- Custom Evil Portal HTML upload from STM32/SD card
+- Custom Evil Portal HTML upload from STM32/SD card with a 32KB limit
+- Custom Evil Portal form/JSON capture helper for JavaScript-driven pages
 - WiFi station join, MAC setting, channel setting, and radio shutdown commands
 - TCP network scanners for SSH, Telnet, and common ports on the joined network
+- Ping Scan and ARP Scan support on the joined network
+- Wardrive and Station Wardrive support for STM32 SD-card CSV exports
+- MAC Track support for selected devices
 - BLE scan and raw advertisement scan support
 - Named BLE advertising
 - Raw BLE advertising payload command for BLE spam payloads

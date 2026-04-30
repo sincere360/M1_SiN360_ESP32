@@ -2,12 +2,17 @@
 #include <errno.h>
 #include <fcntl.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
+#include "esp_netif_net_stack.h"
 #include "esp_log.h"
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
+#include "lwip/etharp.h"
+#include "lwip/ip4_addr.h"
+#include "ping/ping_sock.h"
 #include "wifi_scan.h"
 
 extern bool m1_wifi_is_started(void);
@@ -250,17 +255,26 @@ void wifi_set_channel(const m1_cmd_t *cmd, m1_resp_t *resp)
     resp->status = RESP_OK;
 }
 
-/* ---- LAN TCP scanners ---- */
+/* ---- LAN scanners ---- */
 
 #define NETSCAN_MAX_RESULTS 32
 #define NETSCAN_MODE_SSH    0
 #define NETSCAN_MODE_TELNET 1
 #define NETSCAN_MODE_COMMON 2
+#define NETSCAN_MODE_PING   3
+#define NETSCAN_MODE_ARP    4
 
 typedef struct {
     uint8_t ip[4];
     uint16_t port;
+    uint8_t mac[6];
+    bool has_mac;
 } netscan_result_t;
+
+typedef struct {
+    SemaphoreHandle_t done;
+    bool success;
+} netscan_ping_ctx_t;
 
 static TaskHandle_t netscan_task_handle = NULL;
 static volatile bool netscan_running = false;
@@ -269,6 +283,8 @@ static volatile uint8_t netscan_progress = 0;
 static uint8_t netscan_mode = NETSCAN_MODE_COMMON;
 static uint8_t netscan_timeout_ms = 80;
 static uint8_t netscan_base_ip[4];
+static uint32_t netscan_interface_idx = 0;
+static esp_netif_t *netscan_esp_netif = NULL;
 static netscan_result_t netscan_results[NETSCAN_MAX_RESULTS];
 static uint8_t netscan_result_count = 0;
 static uint8_t netscan_read_idx = 0;
@@ -319,7 +335,89 @@ static bool netscan_tcp_open(uint8_t a, uint8_t b, uint8_t c, uint8_t d, uint16_
     return false;
 }
 
-static void netscan_add_result(uint8_t d, uint16_t port)
+static void netscan_ping_success(esp_ping_handle_t hdl, void *args)
+{
+    (void)hdl;
+    netscan_ping_ctx_t *ctx = (netscan_ping_ctx_t *)args;
+    if (ctx) {
+        ctx->success = true;
+    }
+}
+
+static void netscan_ping_end(esp_ping_handle_t hdl, void *args)
+{
+    (void)hdl;
+    netscan_ping_ctx_t *ctx = (netscan_ping_ctx_t *)args;
+    if (ctx && ctx->done) {
+        xSemaphoreGive(ctx->done);
+    }
+}
+
+static bool netscan_ping_host(uint8_t a, uint8_t b, uint8_t c, uint8_t d, uint8_t timeout_ms)
+{
+    netscan_ping_ctx_t ctx = {
+        .done = xSemaphoreCreateBinary(),
+        .success = false,
+    };
+    if (!ctx.done) return false;
+
+    esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
+    cfg.count = 1;
+    cfg.interval_ms = 10;
+    cfg.timeout_ms = timeout_ms;
+    cfg.data_size = 16;
+    cfg.task_stack_size = 2048;
+    cfg.task_prio = 2;
+    cfg.interface = netscan_interface_idx;
+    IP_ADDR4(&cfg.target_addr, a, b, c, d);
+
+    esp_ping_callbacks_t cbs = {
+        .cb_args = &ctx,
+        .on_ping_success = netscan_ping_success,
+        .on_ping_timeout = NULL,
+        .on_ping_end = netscan_ping_end,
+    };
+
+    esp_ping_handle_t ping = NULL;
+    if (esp_ping_new_session(&cfg, &cbs, &ping) != ESP_OK) {
+        vSemaphoreDelete(ctx.done);
+        return false;
+    }
+
+    if (esp_ping_start(ping) == ESP_OK) {
+        xSemaphoreTake(ctx.done, pdMS_TO_TICKS(timeout_ms + 500));
+    }
+
+    esp_ping_stop(ping);
+    esp_ping_delete_session(ping);
+    vSemaphoreDelete(ctx.done);
+    return ctx.success;
+}
+
+static bool netscan_arp_host(uint8_t a, uint8_t b, uint8_t c, uint8_t d, uint8_t mac[6])
+{
+    if (!netscan_esp_netif) return false;
+
+    struct netif *netif = (struct netif *)esp_netif_get_netif_impl(netscan_esp_netif);
+    if (!netif) return false;
+
+    ip4_addr_t ip;
+    IP4_ADDR(&ip, a, b, c, d);
+
+    etharp_request(netif, &ip);
+    vTaskDelay(pdMS_TO_TICKS(netscan_timeout_ms));
+
+    struct eth_addr *eth_ret = NULL;
+    const ip4_addr_t *ip_ret = NULL;
+    if (etharp_find_addr(netif, &ip, &eth_ret, &ip_ret) >= 0 && eth_ret) {
+        memcpy(mac, eth_ret->addr, 6);
+        return true;
+    }
+
+    return false;
+}
+
+static void netscan_add_result(uint8_t d, uint16_t port, const uint8_t mac[6])
 {
     if (netscan_result_count >= NETSCAN_MAX_RESULTS) return;
 
@@ -329,6 +427,13 @@ static void netscan_add_result(uint8_t d, uint16_t port)
     r->ip[2] = netscan_base_ip[2];
     r->ip[3] = d;
     r->port = port;
+    if (mac) {
+        memcpy(r->mac, mac, sizeof(r->mac));
+        r->has_mac = true;
+    } else {
+        memset(r->mac, 0, sizeof(r->mac));
+        r->has_mac = false;
+    }
 }
 
 static void netscan_task(void *arg)
@@ -347,18 +452,29 @@ static void netscan_task(void *arg)
         if (netscan_mode == NETSCAN_MODE_SSH) {
             if (netscan_tcp_open(netscan_base_ip[0], netscan_base_ip[1], netscan_base_ip[2],
                 (uint8_t)host, 22, netscan_timeout_ms)) {
-                netscan_add_result((uint8_t)host, 22);
+                netscan_add_result((uint8_t)host, 22, NULL);
             }
         } else if (netscan_mode == NETSCAN_MODE_TELNET) {
             if (netscan_tcp_open(netscan_base_ip[0], netscan_base_ip[1], netscan_base_ip[2],
                 (uint8_t)host, 23, netscan_timeout_ms)) {
-                netscan_add_result((uint8_t)host, 23);
+                netscan_add_result((uint8_t)host, 23, NULL);
+            }
+        } else if (netscan_mode == NETSCAN_MODE_PING) {
+            if (netscan_ping_host(netscan_base_ip[0], netscan_base_ip[1], netscan_base_ip[2],
+                (uint8_t)host, netscan_timeout_ms)) {
+                netscan_add_result((uint8_t)host, 0, NULL);
+            }
+        } else if (netscan_mode == NETSCAN_MODE_ARP) {
+            uint8_t mac[6];
+            if (netscan_arp_host(netscan_base_ip[0], netscan_base_ip[1], netscan_base_ip[2],
+                (uint8_t)host, mac)) {
+                netscan_add_result((uint8_t)host, 0, mac);
             }
         } else {
             for (uint8_t i = 0; i < sizeof(common_ports) / sizeof(common_ports[0]) && netscan_running; i++) {
                 if (netscan_tcp_open(netscan_base_ip[0], netscan_base_ip[1], netscan_base_ip[2],
                     (uint8_t)host, common_ports[i], netscan_timeout_ms)) {
-                    netscan_add_result((uint8_t)host, common_ports[i]);
+                    netscan_add_result((uint8_t)host, common_ports[i], NULL);
                 }
             }
         }
@@ -393,8 +509,12 @@ void netscan_start(const m1_cmd_t *cmd, m1_resp_t *resp)
     }
 
     netscan_mode = (cmd->payload_len >= 1) ? cmd->payload[0] : NETSCAN_MODE_COMMON;
-    if (netscan_mode > NETSCAN_MODE_COMMON) netscan_mode = NETSCAN_MODE_COMMON;
+    if (netscan_mode > NETSCAN_MODE_ARP) netscan_mode = NETSCAN_MODE_COMMON;
     netscan_timeout_ms = (cmd->payload_len >= 2 && cmd->payload[1] >= 20) ? cmd->payload[1] : 80;
+
+    netscan_esp_netif = netif;
+    int netif_idx = esp_netif_get_netif_impl_index(netif);
+    netscan_interface_idx = netif_idx > 0 ? (uint32_t)netif_idx : 0;
 
     netscan_base_ip[0] = esp_ip4_addr1_16(&ip_info.ip);
     netscan_base_ip[1] = esp_ip4_addr2_16(&ip_info.ip);
@@ -432,7 +552,13 @@ void netscan_next(const m1_cmd_t *cmd, m1_resp_t *resp)
         resp->payload[6] = (uint8_t)(r->port >> 8);
         resp->payload[7] = netscan_result_count;
         resp->payload[8] = netscan_progress;
-        resp->payload_len = 9;
+        resp->payload[9] = r->has_mac ? 1 : 0;
+        if (r->has_mac) {
+            memcpy(&resp->payload[10], r->mac, 6);
+            resp->payload_len = 16;
+        } else {
+            resp->payload_len = 10;
+        }
         resp->status = RESP_OK;
         return;
     }
