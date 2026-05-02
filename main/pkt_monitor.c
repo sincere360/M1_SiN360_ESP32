@@ -11,6 +11,11 @@ static const char *TAG = "pkt_monitor";
 
 #define PKT_QUEUE_SIZE     32
 #define PKT_DATA_LEN       48
+#define PKT_RAW_QUEUE_SIZE  8
+#define PKT_RAW_DATA_LEN  256
+#define PKT_RAW_HDR_LEN    14
+#define PKT_RAW_FLAG_FIRST 0x01
+#define PKT_RAW_FLAG_LAST  0x02
 #define MAX_STATIONS        64
 #define DEFAULT_HOP_MS      500
 #define NUM_CHANNELS        13
@@ -42,6 +47,17 @@ typedef struct {
     uint8_t  data[PKT_DATA_LEN];
 } pkt_entry_t;
 
+/* ---- Raw frame entry for STM32-side PCAP writing ---- */
+typedef struct {
+    uint32_t ts_us;
+    uint16_t orig_len;
+    uint16_t cap_len;
+    uint16_t offset;
+    int8_t   rssi;
+    uint8_t  channel;
+    uint8_t  data[PKT_RAW_DATA_LEN];
+} pkt_raw_entry_t;
+
 /* ---- Station table entry ---- */
 typedef struct {
     uint8_t  mac[6];
@@ -59,8 +75,12 @@ typedef struct {
 
 /* ---- State ---- */
 static QueueHandle_t      pkt_queue = NULL;
+static QueueHandle_t      raw_queue = NULL;
 static volatile bool      pktmon_active = false;
+static volatile bool      pcap_capture_active = false;
 static uint8_t            sniff_type = SNIFF_ALL;
+static pkt_raw_entry_t    raw_current;
+static bool               raw_current_valid = false;
 
 static esp_timer_handle_t hop_timer = NULL;
 static uint8_t            hop_channel = 1;
@@ -403,6 +423,19 @@ static void IRAM_ATTR promiscuous_rx_cb(void *buf, wifi_promiscuous_pkt_type_t w
         enqueue = true;
     }
 
+    if (enqueue && pcap_capture_active && raw_queue) {
+        pkt_raw_entry_t raw;
+        memset(&raw, 0, sizeof(raw));
+        raw.ts_us = (uint32_t)esp_timer_get_time();
+        raw.orig_len = flen;
+        raw.cap_len = flen;
+        if (raw.cap_len > PKT_RAW_DATA_LEN) raw.cap_len = PKT_RAW_DATA_LEN;
+        raw.rssi = rssi;
+        raw.channel = ch;
+        memcpy(raw.data, f, raw.cap_len);
+        xQueueSend(raw_queue, &raw, 0);
+    }
+
     if (enqueue && pkt_queue) {
         xQueueSend(pkt_queue, &entry, 0);
     }
@@ -415,10 +448,14 @@ void pktmon_init(void)
     if (!pkt_queue) {
         pkt_queue = xQueueCreate(PKT_QUEUE_SIZE, sizeof(pkt_entry_t));
     }
+    if (!raw_queue) {
+        raw_queue = xQueueCreate(PKT_RAW_QUEUE_SIZE, sizeof(pkt_raw_entry_t));
+    }
 }
 
 /*
- * START payload: [0] sniff type, [1] channel (0=hop), [2] hop interval (x100ms, 0=default)
+ * START payload: [0] sniff type, [1] channel (0=hop), [2] hop interval (x100ms, 0=default),
+ *                [3] flags bit0=raw PCAP chunk queue
  */
 void pktmon_start(const m1_cmd_t *cmd, m1_resp_t *resp)
 {
@@ -435,9 +472,13 @@ void pktmon_start(const m1_cmd_t *cmd, m1_resp_t *resp)
     if (cmd->payload_len >= 2) channel   = cmd->payload[1];
     if (cmd->payload_len >= 3 && cmd->payload[2] > 0)
         hop_ms = (uint16_t)cmd->payload[2] * 100;
+    pcap_capture_active = (cmd->payload_len >= 4 && (cmd->payload[3] & 0x01));
 
     if (!pkt_queue) pkt_queue = xQueueCreate(PKT_QUEUE_SIZE, sizeof(pkt_entry_t));
     xQueueReset(pkt_queue);
+    if (!raw_queue) raw_queue = xQueueCreate(PKT_RAW_QUEUE_SIZE, sizeof(pkt_raw_entry_t));
+    if (raw_queue) xQueueReset(raw_queue);
+    raw_current_valid = false;
 
     if (sniff_type == SNIFF_SIGNAL)
         memset(chan_stats, 0, sizeof(chan_stats));
@@ -452,8 +493,8 @@ void pktmon_start(const m1_cmd_t *cmd, m1_resp_t *resp)
 
     pktmon_active = true;
 
-    ESP_LOGI(TAG, "Started: type=%d ch=%d hop=%dms", sniff_type, channel,
-             channel ? 0 : hop_ms);
+    ESP_LOGI(TAG, "Started: type=%d ch=%d hop=%dms pcap=%d", sniff_type, channel,
+             channel ? 0 : hop_ms, pcap_capture_active ? 1 : 0);
     resp->status = RESP_OK;
     resp->payload[0] = sniff_type;
     resp->payload_len = 1;
@@ -513,6 +554,9 @@ void pktmon_stop(const m1_cmd_t *cmd, m1_resp_t *resp)
 {
     (void)cmd;
     pktmon_active = false;
+    pcap_capture_active = false;
+    raw_current_valid = false;
+    if (raw_queue) xQueueReset(raw_queue);
     stop_hop();
     disable_promiscuous_if_idle();
 
@@ -538,6 +582,66 @@ void pktmon_set_channel(const m1_cmd_t *cmd, m1_resp_t *resp)
     resp->status = RESP_OK;
     resp->payload[0] = ch;
     resp->payload_len = 1;
+}
+
+/*
+ * RAW_NEXT response:
+ *   flags(1) + orig_len(2) + cap_len(2) + offset(2) + chunk_len(1) +
+ *   rssi(1) + channel(1) + ts_us(4) + chunk bytes
+ * Empty: payload_len = 0
+ */
+void pktmon_raw_next(const m1_cmd_t *cmd, m1_resp_t *resp)
+{
+    (void)cmd;
+
+    if (!raw_queue) {
+        resp->status = RESP_ERR;
+        return;
+    }
+
+    if (!raw_current_valid) {
+        if (xQueueReceive(raw_queue, &raw_current, 0) != pdTRUE) {
+            resp->status = RESP_OK;
+            resp->payload_len = 0;
+            return;
+        }
+        raw_current.offset = 0;
+        raw_current_valid = true;
+    }
+
+    uint16_t remaining = raw_current.cap_len - raw_current.offset;
+    uint16_t chunk_avail = remaining;
+    if (chunk_avail > M1_MAX_PAYLOAD - PKT_RAW_HDR_LEN) {
+        chunk_avail = M1_MAX_PAYLOAD - PKT_RAW_HDR_LEN;
+    }
+    uint8_t chunk_len = (uint8_t)chunk_avail;
+
+    uint8_t flags = 0;
+    if (raw_current.offset == 0) flags |= PKT_RAW_FLAG_FIRST;
+    if (raw_current.offset + chunk_len >= raw_current.cap_len) flags |= PKT_RAW_FLAG_LAST;
+
+    resp->payload[0] = flags;
+    resp->payload[1] = raw_current.orig_len & 0xFF;
+    resp->payload[2] = (raw_current.orig_len >> 8) & 0xFF;
+    resp->payload[3] = raw_current.cap_len & 0xFF;
+    resp->payload[4] = (raw_current.cap_len >> 8) & 0xFF;
+    resp->payload[5] = raw_current.offset & 0xFF;
+    resp->payload[6] = (raw_current.offset >> 8) & 0xFF;
+    resp->payload[7] = chunk_len;
+    resp->payload[8] = (uint8_t)raw_current.rssi;
+    resp->payload[9] = raw_current.channel;
+    resp->payload[10] = raw_current.ts_us & 0xFF;
+    resp->payload[11] = (raw_current.ts_us >> 8) & 0xFF;
+    resp->payload[12] = (raw_current.ts_us >> 16) & 0xFF;
+    resp->payload[13] = (raw_current.ts_us >> 24) & 0xFF;
+    memcpy(&resp->payload[PKT_RAW_HDR_LEN], &raw_current.data[raw_current.offset], chunk_len);
+    resp->payload_len = PKT_RAW_HDR_LEN + chunk_len;
+    resp->status = RESP_OK;
+
+    raw_current.offset += chunk_len;
+    if (raw_current.offset >= raw_current.cap_len) {
+        raw_current_valid = false;
+    }
 }
 
 /* ---- Station scan ---- */

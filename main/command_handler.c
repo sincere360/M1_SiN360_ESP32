@@ -59,6 +59,13 @@ void cmd_handle(const m1_cmd_t *cmd, m1_resp_t *resp)
     case CMD_BLE_ADV_STOP:    ble_adv_stop(cmd, resp);          break;
     case CMD_BLE_ADV_RAW:     ble_adv_raw(cmd, resp);           break;
     case CMD_BLE_SCAN_NEXT_RAW: ble_scan_next_raw(cmd, resp);    break;
+    case CMD_BLE_ADV_RAW_EX:  ble_adv_raw_ex(cmd, resp);        break;
+    case CMD_BLE_GATT_START:  ble_gatt_start(cmd, resp);        break;
+    case CMD_BLE_GATT_NEXT:   ble_gatt_next(cmd, resp);         break;
+    case CMD_BLE_GATT_STOP:   ble_gatt_stop(cmd, resp);         break;
+    case CMD_BLE_GATT_WRITE:  ble_gatt_write(cmd, resp);        break;
+    case CMD_BLE_GATT_SUB:    ble_gatt_subscribe(cmd, resp);    break;
+    case CMD_BLE_GATT_NOTIF:  ble_gatt_notify_next(cmd, resp);  break;
 
     /* WiFi attacks */
     case CMD_DEAUTH_START:    deauth_start(cmd, resp);          break;
@@ -73,6 +80,8 @@ void cmd_handle(const m1_cmd_t *cmd, m1_resp_t *resp)
     case CMD_DEAUTH_MULTI:    deauth_multi_start(cmd, resp);    break;
     case CMD_KARMA_STATUS:    karma_status(cmd, resp);          break;
     case CMD_KARMA_PORTAL_START: karma_portal_start(cmd, resp); break;
+    case CMD_WIFI_RAW_ATTACK_START: wifi_raw_attack_start(cmd, resp); break;
+    case CMD_WIFI_RAW_ATTACK_STOP: wifi_raw_attack_stop(cmd, resp);   break;
 
     /* Station scan */
     case CMD_STA_SCAN_START:  sta_scan_start(cmd, resp);        break;
@@ -84,6 +93,7 @@ void cmd_handle(const m1_cmd_t *cmd, m1_resp_t *resp)
     case CMD_PKTMON_NEXT:     pktmon_next(cmd, resp);           break;
     case CMD_PKTMON_STOP:     pktmon_stop(cmd, resp);           break;
     case CMD_PKTMON_SET_CHAN: pktmon_set_channel(cmd, resp);    break;
+    case CMD_PKTMON_RAW_NEXT: pktmon_raw_next(cmd, resp);       break;
 
     /* SSID management */
     case CMD_SSID_ADD:        ssid_add(cmd, resp);              break;
