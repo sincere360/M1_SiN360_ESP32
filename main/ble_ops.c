@@ -7,11 +7,13 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
+#include "host/ble_hs_mbuf.h"
 #include "host/ble_hs_id.h"
 #include "host/ble_gap.h"
 #include "host/ble_gatt.h"
 #include "host/util/util.h"
 #include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
 #include "ble_ops.h"
 
 static const char *TAG = "ble_ops";
@@ -28,6 +30,8 @@ static const char *TAG = "ble_ops";
 #define BLE_GATT_ENTRY_CHR 2
 #define BLE_GATT_ENTRY_DSC 3
 #define BLE_GATT_WRITE_FLAG_NO_RSP 0x01
+#define BLE_HID_APPEARANCE_KEYBOARD 0x03C1
+#define BLE_HID_REPORT_LEN 8
 
 typedef struct {
     uint8_t  addr[6];
@@ -80,6 +84,156 @@ static ble_gatt_entry_t *ble_gatt_read_target = NULL;
 static ble_gatt_notify_entry_t ble_gatt_notifs[MAX_GATT_NOTIFS];
 static uint8_t ble_gatt_notif_count = 0;
 static uint8_t ble_gatt_notif_read = 0;
+static bool ble_hid_active = false;
+static bool ble_hid_connected = false;
+static bool ble_hid_notify_enabled = false;
+static uint16_t ble_hid_conn_handle = 0xFFFF;
+static uint16_t ble_hid_input_handle = 0;
+static uint16_t ble_hid_boot_input_handle = 0;
+static uint8_t ble_hid_protocol_mode = 1;
+static uint8_t ble_hid_control_point = 0;
+static uint8_t ble_hid_input_report[BLE_HID_REPORT_LEN] = {0};
+static uint8_t ble_hid_output_report = 0;
+
+enum {
+    BLE_HID_ACCESS_PROTOCOL_MODE = 1,
+    BLE_HID_ACCESS_INFO,
+    BLE_HID_ACCESS_CONTROL_POINT,
+    BLE_HID_ACCESS_REPORT_MAP,
+    BLE_HID_ACCESS_INPUT_REPORT,
+    BLE_HID_ACCESS_OUTPUT_REPORT,
+    BLE_HID_ACCESS_BOOT_INPUT,
+    BLE_HID_ACCESS_BOOT_OUTPUT,
+    BLE_HID_ACCESS_REPORT_REF_INPUT,
+    BLE_HID_ACCESS_REPORT_REF_OUTPUT,
+};
+
+static const uint8_t ble_hid_info[] = {
+    0x11, 0x01, /* HID 1.11 */
+    0x00,       /* country */
+    0x02        /* normally connectable */
+};
+
+static const uint8_t ble_hid_report_ref_input[] = { 0x01, 0x01 };
+static const uint8_t ble_hid_report_ref_output[] = { 0x01, 0x02 };
+
+static const uint8_t ble_hid_report_map[] = {
+    0x05, 0x01,       /* Usage Page (Generic Desktop) */
+    0x09, 0x06,       /* Usage (Keyboard) */
+    0xA1, 0x01,       /* Collection (Application) */
+    0x85, 0x01,       /* Report ID (1) */
+    0x05, 0x07,       /* Usage Page (Keyboard/Keypad) */
+    0x19, 0xE0,       /* Usage Minimum (Left Ctrl) */
+    0x29, 0xE7,       /* Usage Maximum (Right GUI) */
+    0x15, 0x00,       /* Logical Minimum (0) */
+    0x25, 0x01,       /* Logical Maximum (1) */
+    0x75, 0x01,       /* Report Size (1) */
+    0x95, 0x08,       /* Report Count (8) */
+    0x81, 0x02,       /* Input (Data, Variable, Absolute) */
+    0x95, 0x01,       /* Report Count (1) */
+    0x75, 0x08,       /* Report Size (8) */
+    0x81, 0x01,       /* Input (Constant) */
+    0x95, 0x05,       /* Report Count (5) */
+    0x75, 0x01,       /* Report Size (1) */
+    0x05, 0x08,       /* Usage Page (LEDs) */
+    0x19, 0x01,       /* Usage Minimum (Num Lock) */
+    0x29, 0x05,       /* Usage Maximum (Kana) */
+    0x91, 0x02,       /* Output (Data, Variable, Absolute) */
+    0x95, 0x01,       /* Report Count (1) */
+    0x75, 0x03,       /* Report Size (3) */
+    0x91, 0x01,       /* Output (Constant) */
+    0x95, 0x06,       /* Report Count (6) */
+    0x75, 0x08,       /* Report Size (8) */
+    0x15, 0x00,       /* Logical Minimum (0) */
+    0x25, 0x65,       /* Logical Maximum (101) */
+    0x05, 0x07,       /* Usage Page (Keyboard/Keypad) */
+    0x19, 0x00,       /* Usage Minimum (0) */
+    0x29, 0x65,       /* Usage Maximum (101) */
+    0x81, 0x00,       /* Input (Data, Array) */
+    0xC0              /* End Collection */
+};
+
+static int ble_hid_access_cb(uint16_t conn_handle, uint16_t attr_handle,
+                             struct ble_gatt_access_ctxt *ctxt, void *arg);
+
+static const struct ble_gatt_svc_def ble_hid_svcs[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = BLE_UUID16_DECLARE(0x1812),
+        .characteristics = (struct ble_gatt_chr_def[]) {
+            {
+                .uuid = BLE_UUID16_DECLARE(0x2A4E),
+                .access_cb = ble_hid_access_cb,
+                .arg = (void *)BLE_HID_ACCESS_PROTOCOL_MODE,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE_NO_RSP,
+            },
+            {
+                .uuid = BLE_UUID16_DECLARE(0x2A4A),
+                .access_cb = ble_hid_access_cb,
+                .arg = (void *)BLE_HID_ACCESS_INFO,
+                .flags = BLE_GATT_CHR_F_READ,
+            },
+            {
+                .uuid = BLE_UUID16_DECLARE(0x2A4C),
+                .access_cb = ble_hid_access_cb,
+                .arg = (void *)BLE_HID_ACCESS_CONTROL_POINT,
+                .flags = BLE_GATT_CHR_F_WRITE_NO_RSP,
+            },
+            {
+                .uuid = BLE_UUID16_DECLARE(0x2A4B),
+                .access_cb = ble_hid_access_cb,
+                .arg = (void *)BLE_HID_ACCESS_REPORT_MAP,
+                .flags = BLE_GATT_CHR_F_READ,
+            },
+            {
+                .uuid = BLE_UUID16_DECLARE(0x2A4D),
+                .access_cb = ble_hid_access_cb,
+                .arg = (void *)BLE_HID_ACCESS_INPUT_REPORT,
+                .val_handle = &ble_hid_input_handle,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+                .descriptors = (struct ble_gatt_dsc_def[]) {
+                    {
+                        .uuid = BLE_UUID16_DECLARE(0x2908),
+                        .att_flags = BLE_ATT_F_READ,
+                        .access_cb = ble_hid_access_cb,
+                        .arg = (void *)BLE_HID_ACCESS_REPORT_REF_INPUT,
+                    },
+                    {0}
+                },
+            },
+            {
+                .uuid = BLE_UUID16_DECLARE(0x2A4D),
+                .access_cb = ble_hid_access_cb,
+                .arg = (void *)BLE_HID_ACCESS_OUTPUT_REPORT,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+                .descriptors = (struct ble_gatt_dsc_def[]) {
+                    {
+                        .uuid = BLE_UUID16_DECLARE(0x2908),
+                        .att_flags = BLE_ATT_F_READ,
+                        .access_cb = ble_hid_access_cb,
+                        .arg = (void *)BLE_HID_ACCESS_REPORT_REF_OUTPUT,
+                    },
+                    {0}
+                },
+            },
+            {
+                .uuid = BLE_UUID16_DECLARE(0x2A22),
+                .access_cb = ble_hid_access_cb,
+                .arg = (void *)BLE_HID_ACCESS_BOOT_INPUT,
+                .val_handle = &ble_hid_boot_input_handle,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+            },
+            {
+                .uuid = BLE_UUID16_DECLARE(0x2A32),
+                .access_cb = ble_hid_access_cb,
+                .arg = (void *)BLE_HID_ACCESS_BOOT_OUTPUT,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+            },
+            {0}
+        },
+    },
+    {0}
+};
 
 static int ble_scan_gap_event(struct ble_gap_event *event, void *arg)
 {
@@ -444,6 +598,268 @@ void ble_adv_raw_ex(const m1_cmd_t *cmd, m1_resp_t *resp)
     ble_advertising = true;
     resp->status = RESP_OK;
     resp->payload_len = 0;
+}
+
+/* ---- BLE HID keyboard ---- */
+
+static int ble_hid_append(struct os_mbuf *om, const void *data, uint16_t len)
+{
+    return os_mbuf_append(om, data, len) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+
+static int ble_hid_access_cb(uint16_t conn_handle, uint16_t attr_handle,
+                             struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void)conn_handle;
+    (void)attr_handle;
+    uint32_t item = (uint32_t)arg;
+    uint8_t tmp[BLE_HID_REPORT_LEN];
+    uint16_t len = 0;
+
+    switch (ctxt->op) {
+    case BLE_GATT_ACCESS_OP_READ_CHR:
+    case BLE_GATT_ACCESS_OP_READ_DSC:
+        switch (item) {
+        case BLE_HID_ACCESS_PROTOCOL_MODE:
+            return ble_hid_append(ctxt->om, &ble_hid_protocol_mode, sizeof(ble_hid_protocol_mode));
+        case BLE_HID_ACCESS_INFO:
+            return ble_hid_append(ctxt->om, ble_hid_info, sizeof(ble_hid_info));
+        case BLE_HID_ACCESS_REPORT_MAP:
+            return ble_hid_append(ctxt->om, ble_hid_report_map, sizeof(ble_hid_report_map));
+        case BLE_HID_ACCESS_INPUT_REPORT:
+        case BLE_HID_ACCESS_BOOT_INPUT:
+            return ble_hid_append(ctxt->om, ble_hid_input_report, sizeof(ble_hid_input_report));
+        case BLE_HID_ACCESS_OUTPUT_REPORT:
+        case BLE_HID_ACCESS_BOOT_OUTPUT:
+            return ble_hid_append(ctxt->om, &ble_hid_output_report, sizeof(ble_hid_output_report));
+        case BLE_HID_ACCESS_REPORT_REF_INPUT:
+            return ble_hid_append(ctxt->om, ble_hid_report_ref_input, sizeof(ble_hid_report_ref_input));
+        case BLE_HID_ACCESS_REPORT_REF_OUTPUT:
+            return ble_hid_append(ctxt->om, ble_hid_report_ref_output, sizeof(ble_hid_report_ref_output));
+        default:
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+
+    case BLE_GATT_ACCESS_OP_WRITE_CHR:
+        if (item == BLE_HID_ACCESS_CONTROL_POINT) {
+            if (ble_hs_mbuf_to_flat(ctxt->om, &ble_hid_control_point,
+                                    sizeof(ble_hid_control_point), &len) != 0 || len < 1) {
+                return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+            }
+            return 0;
+        }
+        if (item == BLE_HID_ACCESS_PROTOCOL_MODE) {
+            if (ble_hs_mbuf_to_flat(ctxt->om, &ble_hid_protocol_mode,
+                                    sizeof(ble_hid_protocol_mode), &len) != 0 || len < 1) {
+                return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+            }
+            if (ble_hid_protocol_mode > 1) {
+                ble_hid_protocol_mode = 1;
+            }
+            return 0;
+        }
+        if (item == BLE_HID_ACCESS_OUTPUT_REPORT || item == BLE_HID_ACCESS_BOOT_OUTPUT) {
+            if (ble_hs_mbuf_to_flat(ctxt->om, tmp, sizeof(tmp), &len) == 0 && len > 0) {
+                ble_hid_output_report = tmp[0];
+            }
+            return 0;
+        }
+        return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
+
+    default:
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+}
+
+static int ble_hid_gap_event(struct ble_gap_event *event, void *arg)
+{
+    (void)arg;
+
+    switch (event->type) {
+    case BLE_GAP_EVENT_CONNECT:
+        if (event->connect.status == 0) {
+            ble_hid_connected = true;
+            ble_hid_conn_handle = event->connect.conn_handle;
+            ble_advertising = false;
+            ESP_LOGI(TAG, "BLE HID connected");
+        } else {
+            ble_hid_connected = false;
+            ble_hid_conn_handle = 0xFFFF;
+            ble_advertising = false;
+            if (ble_hid_active) {
+                m1_resp_t dummy_resp;
+                m1_cmd_t dummy_cmd;
+                memset(&dummy_cmd, 0, sizeof(dummy_cmd));
+                memset(&dummy_resp, 0, sizeof(dummy_resp));
+                ble_hid_start(&dummy_cmd, &dummy_resp);
+            }
+        }
+        break;
+
+    case BLE_GAP_EVENT_DISCONNECT:
+        ESP_LOGI(TAG, "BLE HID disconnected");
+        ble_hid_connected = false;
+        ble_hid_notify_enabled = false;
+        ble_hid_conn_handle = 0xFFFF;
+        ble_advertising = false;
+        if (ble_hid_active) {
+            m1_resp_t dummy_resp;
+            m1_cmd_t dummy_cmd;
+            memset(&dummy_cmd, 0, sizeof(dummy_cmd));
+            memset(&dummy_resp, 0, sizeof(dummy_resp));
+            ble_hid_start(&dummy_cmd, &dummy_resp);
+        }
+        break;
+
+    case BLE_GAP_EVENT_SUBSCRIBE:
+        if (event->subscribe.attr_handle == ble_hid_input_handle ||
+            event->subscribe.attr_handle == ble_hid_boot_input_handle) {
+            ble_hid_notify_enabled = event->subscribe.cur_notify != 0;
+        }
+        break;
+
+    default:
+        break;
+    }
+    return 0;
+}
+
+static int ble_hid_advertise(const char *name, uint8_t name_len)
+{
+    static const ble_uuid16_t hid_uuid = BLE_UUID16_INIT(0x1812);
+
+    ble_gap_adv_stop();
+    ble_gap_disc_cancel();
+    ble_advertising = false;
+
+    int rc = ble_set_random_static_addr();
+    if (rc != 0) {
+        ESP_LOGE(TAG, "BLE HID random addr set failed: %d", rc);
+        return rc;
+    }
+
+    ble_svc_gap_device_name_set(name);
+    ble_svc_gap_device_appearance_set(BLE_HID_APPEARANCE_KEYBOARD);
+
+    struct ble_hs_adv_fields adv_fields = {0};
+    adv_fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    adv_fields.name = (const uint8_t *)name;
+    adv_fields.name_len = name_len;
+    adv_fields.name_is_complete = 1;
+    adv_fields.appearance = BLE_HID_APPEARANCE_KEYBOARD;
+    adv_fields.appearance_is_present = 1;
+    adv_fields.uuids16 = &hid_uuid;
+    adv_fields.num_uuids16 = 1;
+    adv_fields.uuids16_is_complete = 1;
+
+    rc = ble_gap_adv_set_fields(&adv_fields);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "BLE HID adv fields failed: %d", rc);
+        return rc;
+    }
+
+    struct ble_gap_adv_params adv_params = {
+        .conn_mode = BLE_GAP_CONN_MODE_UND,
+        .disc_mode = BLE_GAP_DISC_MODE_GEN,
+        .itvl_min = 0x0030,
+        .itvl_max = 0x0060,
+    };
+
+    rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER,
+                           &adv_params, ble_hid_gap_event, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "BLE HID adv start failed: %d", rc);
+        return rc;
+    }
+
+    ble_advertising = true;
+    return 0;
+}
+
+void ble_hid_start(const m1_cmd_t *cmd, m1_resp_t *resp)
+{
+    char name[30] = "Keyboard";
+    uint8_t name_len = 8;
+
+    if (!ble_host_synced) {
+        resp->status = RESP_ERR;
+        return;
+    }
+
+    if (cmd->payload_len > 0) {
+        name_len = cmd->payload_len;
+        if (name_len > sizeof(name) - 1) name_len = sizeof(name) - 1;
+        memcpy(name, cmd->payload, name_len);
+        name[name_len] = '\0';
+    }
+
+    ble_hid_active = true;
+    ble_hid_connected = false;
+    ble_hid_notify_enabled = false;
+    ble_hid_conn_handle = 0xFFFF;
+    memset(ble_hid_input_report, 0, sizeof(ble_hid_input_report));
+
+    int rc = ble_hid_advertise(name, name_len);
+    resp->status = (rc == 0) ? RESP_OK : RESP_ERR;
+    resp->payload_len = 0;
+}
+
+void ble_hid_stop(const m1_cmd_t *cmd, m1_resp_t *resp)
+{
+    (void)cmd;
+
+    ble_hid_active = false;
+    ble_hid_notify_enabled = false;
+    memset(ble_hid_input_report, 0, sizeof(ble_hid_input_report));
+    if (ble_hid_connected && ble_hid_conn_handle != 0xFFFF) {
+        ble_gap_terminate(ble_hid_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    } else {
+        ble_gap_adv_stop();
+    }
+    ble_hid_connected = false;
+    ble_hid_conn_handle = 0xFFFF;
+    ble_advertising = false;
+
+    resp->status = RESP_OK;
+    resp->payload_len = 0;
+}
+
+void ble_hid_report(const m1_cmd_t *cmd, m1_resp_t *resp)
+{
+    if (!ble_hid_active || !ble_hid_connected || ble_hid_conn_handle == 0xFFFF) {
+        resp->status = RESP_BUSY;
+        return;
+    }
+
+    if (cmd->payload_len != BLE_HID_REPORT_LEN) {
+        resp->status = RESP_ERR;
+        return;
+    }
+
+    memcpy(ble_hid_input_report, cmd->payload, BLE_HID_REPORT_LEN);
+    if (ble_hid_input_handle != 0) {
+        ble_gatts_chr_updated(ble_hid_input_handle);
+    }
+    if (ble_hid_boot_input_handle != 0) {
+        ble_gatts_chr_updated(ble_hid_boot_input_handle);
+    }
+
+    resp->status = RESP_OK;
+    resp->payload_len = 0;
+}
+
+void ble_hid_status(const m1_cmd_t *cmd, m1_resp_t *resp)
+{
+    (void)cmd;
+
+    resp->status = RESP_OK;
+    resp->payload[0] = ble_hid_active ? 1 : 0;
+    resp->payload[1] = ble_hid_connected ? 1 : 0;
+    resp->payload[2] = ble_hid_notify_enabled ? 1 : 0;
+    resp->payload[3] = ble_advertising ? 1 : 0;
+    resp->payload[4] = ble_hid_conn_handle & 0xFF;
+    resp->payload[5] = (ble_hid_conn_handle >> 8) & 0xFF;
+    resp->payload_len = 6;
 }
 
 /* ---- GATT discovery ---- */
@@ -992,6 +1408,19 @@ void ble_ops_init(void)
     int rc = nimble_port_init();
     if (rc != 0) {
         ESP_LOGE(TAG, "NimBLE init failed: %d", rc);
+        return;
+    }
+
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    rc = ble_gatts_count_cfg(ble_hid_svcs);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "BLE HID GATT count failed: %d", rc);
+        return;
+    }
+    rc = ble_gatts_add_svcs(ble_hid_svcs);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "BLE HID GATT add failed: %d", rc);
         return;
     }
 

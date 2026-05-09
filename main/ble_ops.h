@@ -17,3 +17,7 @@ void ble_gatt_stop(const m1_cmd_t *cmd, m1_resp_t *resp);
 void ble_gatt_write(const m1_cmd_t *cmd, m1_resp_t *resp);
 void ble_gatt_subscribe(const m1_cmd_t *cmd, m1_resp_t *resp);
 void ble_gatt_notify_next(const m1_cmd_t *cmd, m1_resp_t *resp);
+void ble_hid_start(const m1_cmd_t *cmd, m1_resp_t *resp);
+void ble_hid_stop(const m1_cmd_t *cmd, m1_resp_t *resp);
+void ble_hid_report(const m1_cmd_t *cmd, m1_resp_t *resp);
+void ble_hid_status(const m1_cmd_t *cmd, m1_resp_t *resp);

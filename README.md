@@ -10,7 +10,7 @@ This firmware runs on the M1's ESP32-C6 and provides the WiFi/BLE backend used b
 
 ## Compatibility
 
-This release pairs with **M1 SiN360 STM32 firmware v0.9.0.9** and later STM32 releases that do not change the WiFi/BLE SPI command protocol.
+This release pairs with **M1 SiN360 STM32 firmware v0.9.1.0** and later STM32 releases that do not change the WiFi/BLE SPI command protocol.
 
 STM32 releases:
 
@@ -35,6 +35,10 @@ STM32 releases:
 - BLE scan and raw advertisement scan support
 - Named BLE advertising
 - Raw BLE advertising payload command for BLE spam payloads
+- Extended raw BLE advertising controls for random address and spam speed
+- BLE GATT discovery, characteristic write, notification, and indication support
+- BLE HID keyboard backend for BadBLE scripts
+- BLE HID advertising uses a generic `Keyboard` name and rotates the BLE address when started
 
 ## Build Requirements
 
@@ -79,7 +83,7 @@ Adjust the serial port for your machine.
 
 ## Build SD-Update Artifacts
 
-The STM32 ESP32 updater expects a merged binary and a strict uppercase MD5 sidecar.
+The STM32 ESP32 updater expects a merged binary and matching MD5 sidecar.
 
 ```bash
 idf.py merge-bin -o m1_esp32_merged.bin
@@ -94,7 +98,7 @@ build/m1_esp32_merged.bin
 build/m1_esp32_merged.md5
 ```
 
-The `.md5` file must be exactly 32 uppercase hex characters with no newline.
+The `.md5` file must match the format expected by the STM32 updater.
 
 ## Notes
 
@@ -102,4 +106,4 @@ Deauth patch credit: neddy299
 
 WiFi promiscuous mode and BLE advertising share the ESP32-C6 radio. The firmware stops conflicting modes before starting new WiFi/BLE operations, but user-facing flows should still avoid running WiFi sniffers and BLE advertising at the same time.
 
-Detailed user how-tos are coming later.
+User workflows are documented in the main STM32 firmware repo.

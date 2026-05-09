@@ -105,7 +105,7 @@ static void spi_command_loop(void *arg)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "M1 SiN360 ESP32-C6 FW v0.9.0.9");
+    ESP_LOGI(TAG, "M1 SiN360 ESP32-C6 FW v0.9.1.0");
 
     /* NVS init with erase fallback — required before WiFi */
     esp_err_t ret = nvs_flash_init();

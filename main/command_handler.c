@@ -66,6 +66,10 @@ void cmd_handle(const m1_cmd_t *cmd, m1_resp_t *resp)
     case CMD_BLE_GATT_WRITE:  ble_gatt_write(cmd, resp);        break;
     case CMD_BLE_GATT_SUB:    ble_gatt_subscribe(cmd, resp);    break;
     case CMD_BLE_GATT_NOTIF:  ble_gatt_notify_next(cmd, resp);  break;
+    case CMD_BLE_HID_START:   ble_hid_start(cmd, resp);         break;
+    case CMD_BLE_HID_STOP:    ble_hid_stop(cmd, resp);          break;
+    case CMD_BLE_HID_REPORT:  ble_hid_report(cmd, resp);        break;
+    case CMD_BLE_HID_STATUS:  ble_hid_status(cmd, resp);        break;
 
     /* WiFi attacks */
     case CMD_DEAUTH_START:    deauth_start(cmd, resp);          break;
